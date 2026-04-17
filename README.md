@@ -1,6 +1,6 @@
 # 极速视频压缩 (Video Compressor)
 
-一个基于 FFmpeg Kit 开发的高性能 Android 视频压缩工具。支持大视频处理、硬件加速以及智能质量检测。
+一个基于 FFmpeg Kit 开发的高性能 Android 视频压缩工具app。android studio打开后编译、安装，支持大视频处理、硬件加速以及智能质量检测。
 
 ## 🌟 核心功能
 
