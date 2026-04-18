@@ -10,7 +10,8 @@ object FileUtils {
     fun getPath(context: Context, uri: Uri): String? {
         return try {
             context.contentResolver.openInputStream(uri)?.use { inputStream ->
-                val file = File(context.cacheDir, "temp_${System.currentTimeMillis()}.mp4")
+                // 使用更具识别性的前缀
+                val file = File(context.cacheDir, "input_tmp_${System.currentTimeMillis()}.mp4")
                 FileOutputStream(file).use { outputStream ->
                     inputStream.copyTo(outputStream)
                 }
@@ -19,6 +20,22 @@ object FileUtils {
         } catch (e: Exception) {
             e.printStackTrace()
             null
+        }
+    }
+
+    /**
+     * 清理缓存目录下的临时文件，整理内存
+     */
+    fun clearTempFiles(context: Context) {
+        try {
+            val folders = listOf(context.cacheDir, context.externalCacheDir)
+            folders.forEach { folder ->
+                folder?.listFiles { _, name ->
+                    name.startsWith("input_tmp_") || name.startsWith("comp_tmp_")
+                }?.forEach { it.delete() }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 

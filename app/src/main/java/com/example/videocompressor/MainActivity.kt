@@ -1,11 +1,11 @@
 package com.example.videocompressor
 
 import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
-import android.os.Bundle
-import android.os.Environment
+import android.os.*
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.util.Log
 import android.view.View
@@ -18,6 +18,7 @@ import androidx.recyclerview.widget.RecyclerView
 import com.arthenica.ffmpegkit.*
 import com.google.android.material.materialswitch.MaterialSwitch
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : AppCompatActivity() {
 
@@ -33,7 +34,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var buttonCompress: Button
     private lateinit var buttonStop: Button
 
-    private var isCancelled = false
+    private val isCancelled = AtomicBoolean(false)
+    private var wakeLock: PowerManager.WakeLock? = null
 
     private val pickVideos =
         registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
@@ -86,10 +88,24 @@ class MainActivity : AppCompatActivity() {
         buttonCompress.setOnClickListener { startCompressBatch() }
 
         buttonStop.setOnClickListener {
-            isCancelled = true
+            isCancelled.set(true)
             FFmpegKit.cancel()
+            releaseWakeLock()
             Toast.makeText(this, "正在强行中止当前任务...", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock == null) {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VideoCompressor::Compressing")
+            wakeLock?.acquire(60 * 60 * 1000L) // 最长锁定1小时
+        }
+    }
+
+    private fun releaseWakeLock() {
+        if (wakeLock?.isHeld == true) wakeLock?.release()
+        wakeLock = null
     }
 
     private fun getTargetWidth(resolution: String): Int {
@@ -113,28 +129,28 @@ class MainActivity : AppCompatActivity() {
     private fun startCompressBatch() {
         if (selectedUris.isEmpty()) return Toast.makeText(this, "请先选择视频文件", Toast.LENGTH_SHORT).show()
 
-        if (outputFolderUri == null) {
-            textStatus.text = "提示：未选目录，将默认存入原目录或系统相册"
-        }
+        FileUtils.clearTempFiles(this) // 清理旧缓存
+        isCancelled.set(false)
+        acquireWakeLock()
 
-        isCancelled = false
         buttonCompress.isEnabled = false
         buttonStop.visibility = View.VISIBLE
         progressBar.visibility = View.VISIBLE
-        progressBar.isIndeterminate = true 
+        progressBar.progress = 0
         textStatus.visibility = View.VISIBLE
 
         processVideo(0)
     }
 
     private fun processVideo(index: Int) {
-        if (index >= selectedUris.size || isCancelled) {
+        if (index >= selectedUris.size || isCancelled.get()) {
             runOnUiThread {
                 buttonCompress.isEnabled = true
                 buttonStop.visibility = View.GONE
                 progressBar.visibility = View.GONE
-                textStatus.text = if (isCancelled) "已中断" else "全部任务处理完成！"
-                if (!isCancelled && switchDelete.isChecked) {
+                textStatus.text = if (isCancelled.get()) "已中断" else "全部任务处理完成！"
+                releaseWakeLock()
+                if (!isCancelled.get() && switchDelete.isChecked) {
                     selectedUris.clear()
                     adapter.notifyDataSetChanged()
                 }
@@ -148,12 +164,11 @@ class MainActivity : AppCompatActivity() {
         Thread {
             try {
                 val originalName = FileUtils.getFileName(this, uri)
-                val nameWithoutExt = originalName.substringBeforeLast(".", "video")
-                val outputFileName = "${nameWithoutExt}_compressed.mp4"
+                val outputFileName = "${originalName.substringBeforeLast(".", "video")}_compressed.mp4"
 
                 runOnUiThread { 
                     progressBar.isIndeterminate = true
-                    textStatus.text = "[$index/${selectedUris.size}] 准备中: $originalName"
+                    textStatus.text = "正在读取 ($index/${selectedUris.size}): $originalName"
                 }
                 
                 val tempInputPath = FileUtils.getPath(this, uri) ?: return@Thread
@@ -169,19 +184,19 @@ class MainActivity : AppCompatActivity() {
                 val targetBitrate = getTargetBitrate(resolution)
                 val tempOutput = File(externalCacheDir ?: cacheDir, "comp_tmp_${System.currentTimeMillis()}.mp4")
 
-                // 智能判断：是否需要压缩
+                runOnUiThread { progressBar.isIndeterminate = false }
+
                 if (srcWidth <= targetWidth && srcBitrate <= targetBitrate && srcBitrate > 0 && srcFormat.contains("h264")) {
-                    runOnUiThread { textStatus.text = "规格已达标，正在极速封装..." }
+                    runOnUiThread { textStatus.text = "规格已达标，正在封装..." }
                     val cmd = "-y -i \"$tempInputPath\" -c copy \"${tempOutput.absolutePath}\""
-                    executeSimple(cmd, tempInputPath, tempOutput, outputFileName, uri, index, 0.0, originalName)
+                    executeSimple(cmd, tempInputPath, tempOutput, outputFileName, uri, index, durationMs, originalName)
                 } else {
-                    val hwCmd = "-y -threads 0 -i \"$tempInputPath\" -vf \"scale=$targetWidth:-2,format=yuv420p\" " +
+                    val hwCmd = "-y -threads 4 -i \"$tempInputPath\" -vf \"scale=$targetWidth:-2,format=yuv420p\" " +
                                 "-c:v h264_mediacodec -b:v ${targetBitrate/1000}k -c:a aac -b:a 128k \"${tempOutput.absolutePath}\""
                     
-                    val swCmd = "-y -threads 0 -i \"$tempInputPath\" -vf \"scale=$targetWidth:-2,format=yuv420p\" " +
+                    val swCmd = "-y -threads 4 -i \"$tempInputPath\" -vf \"scale=$targetWidth:-2,format=yuv420p\" " +
                                 "-c:v libx264 -preset ultrafast -crf 28 -c:a aac -b:a 128k \"${tempOutput.absolutePath}\""
 
-                    runOnUiThread { progressBar.isIndeterminate = false }
                     executeWithFallback(hwCmd, swCmd, tempInputPath, tempOutput, outputFileName, uri, index, durationMs, originalName)
                 }
             } catch (e: Exception) {
@@ -193,12 +208,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun executeWithFallback(hw: String, sw: String, tIn: String, tOut: File, outName: String, u: Uri, idx: Int, dur: Double, oName: String) {
         FFmpegKit.executeAsync(hw, { session ->
-            if (ReturnCode.isSuccess(session.returnCode) && !isCancelled) {
+            if (ReturnCode.isSuccess(session.returnCode) && !isCancelled.get()) {
                 finalizeAndSave(tIn, tOut, outName, u, idx)
-            } else if (!isCancelled && !ReturnCode.isCancel(session.returnCode)) {
-                runOnUiThread { textStatus.text = "模式切换中..." }
+            } else if (!isCancelled.get() && !ReturnCode.isCancel(session.returnCode)) {
+                runOnUiThread { textStatus.text = "硬件加速失败，尝试软件模式..." }
                 FFmpegKit.executeAsync(sw, { swSession ->
-                    if (ReturnCode.isSuccess(swSession.returnCode) && !isCancelled) {
+                    if (ReturnCode.isSuccess(swSession.returnCode) && !isCancelled.get()) {
                         finalizeAndSave(tIn, tOut, outName, u, idx)
                     } else {
                         cleanupAndNext(tIn, tOut, idx)
@@ -212,7 +227,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun executeSimple(cmd: String, tIn: String, tOut: File, outName: String, u: Uri, idx: Int, dur: Double, oName: String) {
         FFmpegKit.executeAsync(cmd, { session ->
-            if (ReturnCode.isSuccess(session.returnCode) && !isCancelled) {
+            if (ReturnCode.isSuccess(session.returnCode) && !isCancelled.get()) {
                 finalizeAndSave(tIn, tOut, outName, u, idx)
             } else {
                 cleanupAndNext(tIn, tOut, idx)
@@ -225,48 +240,71 @@ class MainActivity : AppCompatActivity() {
             val p = (stats.time.toDouble() / dur * 100).toInt()
             runOnUiThread {
                 progressBar.progress = p.coerceIn(0, 100)
-                textStatus.text = "正在压缩 ($idx/${selectedUris.size}): $oName ($p%)"
+                textStatus.text = "正在压缩 (${idx + 1}/${selectedUris.size}): $oName ($p%)"
             }
         }
     }
 
     private fun finalizeAndSave(tIn: String, tOut: File, outName: String, inputUri: Uri, idx: Int) {
         if (tOut.exists() && tOut.length() > 0) {
+            var saved = false
             if (outputFolderUri != null) {
                 val folder = DocumentFile.fromTreeUri(this, outputFolderUri!!)
                 folder?.createFile("video/mp4", outName)?.let { target ->
-                    contentResolver.openOutputStream(target.uri)?.use { os -> tOut.inputStream().use { it.copyTo(os) } }
-                    if (switchDelete.isChecked) contentResolver.delete(inputUri, null, null)
+                    contentResolver.openOutputStream(target.uri)?.use { os -> 
+                        tOut.inputStream().use { it.copyTo(os) } 
+                    }
+                    saved = true
                 }
             } else {
-                saveToGallery(tOut, outName, inputUri)
+                saved = saveToGallery(tOut, outName, inputUri)
+            }
+
+            if (saved && switchDelete.isChecked) {
+                safeDeleteOriginal(inputUri)
             }
         }
         cleanupAndNext(tIn, tOut, idx)
     }
 
-    private fun saveToGallery(file: File, name: String, inputUri: Uri) {
-        val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, name)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                var path = Environment.DIRECTORY_MOVIES + "/视频压缩"
-                try {
-                    contentResolver.query(inputUri, arrayOf(MediaStore.Video.Media.RELATIVE_PATH), null, null, null)?.use { c ->
-                        if (c.moveToFirst()) {
-                            val rel = c.getString(0)
-                            if (rel != null) path = rel
+    private fun saveToGallery(file: File, name: String, inputUri: Uri): Boolean {
+        return try {
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, name)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    var path = Environment.DIRECTORY_MOVIES + "/视频压缩"
+                    try {
+                        contentResolver.query(inputUri, arrayOf(MediaStore.Video.Media.RELATIVE_PATH), null, null, null)?.use { c ->
+                            if (c.moveToFirst()) {
+                                val rel = c.getString(0)
+                                if (rel != null) path = rel
+                            }
                         }
-                    }
-                } catch (e: Exception) {}
-                put(MediaStore.Video.Media.RELATIVE_PATH, path)
+                    } catch (e: Exception) {}
+                    put(MediaStore.Video.Media.RELATIVE_PATH, path)
+                }
             }
+            val col = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY) 
+                      else MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            contentResolver.insert(col, values)?.let { target ->
+                contentResolver.openOutputStream(target)?.use { os -> file.inputStream().use { it.copyTo(os) } }
+                true
+            } ?: false
+        } catch (e: Exception) {
+            false
         }
-        val col = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY) 
-                  else MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-        contentResolver.insert(col, values)?.let { target ->
-            contentResolver.openOutputStream(target)?.use { os -> file.inputStream().use { it.copyTo(os) } }
-            if (switchDelete.isChecked) contentResolver.delete(inputUri, null, null)
+    }
+
+    private fun safeDeleteOriginal(uri: Uri) {
+        try {
+            if (DocumentsContract.isDocumentUri(this, uri)) {
+                DocumentsContract.deleteDocument(contentResolver, uri)
+            } else {
+                contentResolver.delete(uri, null, null)
+            }
+        } catch (e: Exception) {
+            Log.e("Compress", "删除原文件失败: $uri", e)
         }
     }
 
@@ -274,5 +312,10 @@ class MainActivity : AppCompatActivity() {
         File(tIn).delete()
         if (tOut.exists()) tOut.delete()
         runOnUiThread { processVideo(idx + 1) }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        releaseWakeLock()
     }
 }
